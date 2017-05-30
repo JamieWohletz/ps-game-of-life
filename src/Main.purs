@@ -1,122 +1,125 @@
 module Main where
 
-import Control.Monad.Aff.Console (CONSOLE)
+import Control.Monad.Aff (Aff)
 import Control.Monad.Eff (Eff)
+import Control.Monad.Eff.Console (CONSOLE, log)
 import Control.Monad.Eff.Class (liftEff)
 import Control.Monad.Eff.Random (RANDOM)
+import Control.Monad.Eff.Timer (TIMER)
+import ConwayGrid (ConwayGrid, blankGrid, isAlive, seed, aliveNeighborCount)
+import DOM (DOM)
+import DOM.HTML (window)
+import DOM.HTML.Document (body)
+import DOM.HTML.Types (htmlElementToElement)
+import DOM.HTML.Window (document)
+import DOM.Node.Element (clientWidth, clientHeight)
 import Data.Array ((..))
 import Data.Either (Either, either)
 import Data.Foldable (traverse_)
-import Data.Maybe (Maybe(..))
-import Grid (Grid, blankGrid, isAlive, seed)
+import Data.Int (floor)
+import Data.Map (mapWithKey)
+import Data.Maybe (Maybe(..), fromJust)
+import Partial.Unsafe (unsafePartial)
 import Point (Point, point)
-import Pux (CoreEffects, EffModel, start)
-import Pux.DOM.Events (onClick)
+import Pux (CoreEffects, App, EffModel, start)
+import Pux.DOM.Events (DOMEvent)
 import Pux.DOM.HTML (HTML)
 import Pux.Renderer.React (renderToDOM)
-import Text.Smolder.HTML (button, div, h1, span, table, tbody, td, tr)
+import Signal ((~>))
+import Signal.Time (every)
+import Text.Smolder.HTML (table, tbody, td, tr)
 import Text.Smolder.HTML.Attributes (className)
-import Text.Smolder.Markup (text, (#!), (!))
+import Text.Smolder.Markup (text, (!))
 import Prelude hiding (div)
 
+type WebApp = App (DOMEvent -> Event) Event State
+
 type State = {
-  gridSize :: Int,
-  grid :: Grid
+  seeded :: Boolean,
+  grid :: ConwayGrid,
+  width :: Int,
+  height :: Int,
+  step :: Int
 }
 
-data Event = SetGrid Grid | SetGridSize Int | SeedGrid
+data Event = SetGrid ConwayGrid | SeedGrid | Simulate | Step Int ConwayGrid
 
-initialState :: State 
-initialState = {
-  gridSize: 10,
-  grid: blankGrid 10 10
+initialState :: Int -> Int -> State 
+initialState w h = {
+  seeded: false,
+  width: w,
+  height: h,
+  grid: blankGrid w h,
+  step: 0
 }
 
-renderGrid :: Int -> Grid -> HTML Event
-renderGrid size grid = table ! className "conway-grid" $ tbody $ traverse_ buildRow (0..size)
+renderGrid :: Int -> Int -> ConwayGrid -> HTML Event
+renderGrid w h grid = table ! className "conway-grid" $ tbody $ traverse_ buildRow (0..h)
   where 
     buildRow :: Int -> HTML Event
     buildRow rowIndex = tr ! className "row" $ do 
-      traverse_ (buildCell rowIndex) (0..size)
+      traverse_ (buildCell rowIndex) (0..w)
     buildCell :: Int -> Int -> HTML Event
     buildCell rowIndex cellIndex = td ! className ("cell " <> cellClass (point cellIndex rowIndex) grid) $ text ""
 
-cellClass :: Point -> Grid -> String
+cellClass :: Point -> ConwayGrid -> String
 cellClass p g = transform $ isAlive p g
   where 
     transform :: Either String Boolean -> String
     transform = either (const "error") (\b -> if b then "alive" else "dead")
 
+runGame :: forall eff. State -> Aff (console :: CONSOLE | eff) (Maybe Event)
+runGame { seeded, grid, step }
+  | seeded == false = pure $ Just SeedGrid
+  | otherwise = do 
+    let newGrid = simulateStep grid
+    if newGrid == grid 
+      then pure Nothing 
+      else pure $ Just $ Step (step + 1) $ simulateStep grid
+
+simulateStep :: ConwayGrid -> ConwayGrid
+simulateStep g = mapWithKey simulate g
+  where 
+    simulate :: Point -> Boolean -> Boolean
+    simulate pt alive =
+      let alives = aliveNeighborCount pt g in
+      (alive && (alives == 2 || alives == 3)) || 
+      (not alive && (alives == 3))
+
 -- | Return a new state (and effects) from each event
-foldp :: ∀ fx. Event -> State -> EffModel State Event (console :: CONSOLE, random :: RANDOM | fx)
+foldp :: forall fx. Event -> State -> EffModel State Event (console :: CONSOLE, random :: RANDOM | fx)
 foldp (SetGrid grid) st = { state: st { grid = grid }, effects: [] } 
-foldp (SetGridSize size) st = { state: st { gridSize = size, grid = blankGrid size size }, effects: [] }
-foldp (SeedGrid) st@{ grid } = { state: st, effects: [ liftEff $ seed grid >>= (\g -> pure $ Just $ SetGrid g)]}
+foldp (Step step grid) st = { state: st { grid = grid, step = step }, effects: []}
+foldp (SeedGrid) st@{ grid } = { state: st { seeded = true }, effects: [ liftEff $ seed grid >>= (\g -> pure $ Just $ SetGrid g)]}
+foldp (Simulate) st@{ step } = { state: st, effects: [ runGame st ] }
 
 -- | Return markup from the state
 view :: State -> HTML Event
-view { gridSize, grid } =
-  div do
-    h1 $ text "Conway's Game of Life"
-    span $ text "Select a grid size: "
-    button #! onClick (const (SetGridSize 10)) $ text "10x10"
-    button #! onClick (const (SetGridSize 20)) $ text "20x20"
-    button #! onClick (const (SetGridSize 30)) $ text "30x30"
-    button #! onClick (const SeedGrid) $ text "Seed"
-    renderGrid gridSize grid
+view { width, height, grid, step } =
+  renderGrid width height grid
 
 -- | Start and render the app
-main :: ∀ fx. Eff (CoreEffects (console :: CONSOLE, random :: RANDOM | fx)) Unit
+main :: forall fx. Eff (CoreEffects (dom :: DOM, console :: CONSOLE, timer :: TIMER, random :: RANDOM | fx)) WebApp
 main = do
+  let animationSignal = every 1000.00
+  let animation = animationSignal ~> \_ -> Simulate
+  win <- window
+  doc <- document win
+  maybeBod <- body doc
+  let bod = unsafePartial $ fromJust maybeBod
+  let bodyElement = htmlElementToElement bod
+  w <- clientWidth bodyElement
+  h <- clientHeight bodyElement
+  let gridWidth = (floor w) / 50
+  let gridHeight = (floor h) / 50
+  log $ show w <> " " <> show h
   app <- start
-    { initialState
+    { initialState: initialState gridWidth gridHeight
     , view
     , foldp
-    , inputs: []
+    , inputs: [animation]
     }
 
   renderToDOM "#app" app.markup app.input
--- module Main where
 
--- import Prelude
--- import App.Events (AppEffects, Event(..), foldp)
--- import App.Routes (match)
--- import App.State (State, init)
--- import App.View.Layout (view)
--- import Control.Monad.Eff (Eff)
--- import DOM (DOM)
--- import DOM.HTML (window)
--- import DOM.HTML.Types (HISTORY)
--- import Pux (CoreEffects, App, start)
--- import Pux.DOM.Events (DOMEvent)
--- import Pux.DOM.History (sampleURL)
--- import Pux.Renderer.React (renderToDOM)
--- import Signal ((~>))
-
--- type WebApp = App (DOMEvent -> Event) Event State
-
--- type ClientEffects = CoreEffects (AppEffects (history :: HISTORY, dom :: DOM))
-
--- main :: String -> State -> Eff ClientEffects WebApp
--- main url state = do
---   -- | Create a signal of URL changes.
---   urlSignal <- sampleURL =<< window
-
---   -- | Map a signal of URL changes to PageView actions.
---   let routeSignal = urlSignal ~> \r -> PageView (match r)
-
---   -- | Start the app.
---   app <- start
---     { initialState: state
---     , view
---     , foldp
---     , inputs: [routeSignal] }
-
---   -- | Render to the DOM
---   renderToDOM "#app" app.markup app.input
-
---   -- | Return app to be used for hot reloading logic in support/client.entry.js
---   pure app
-
--- initialState :: State
--- initialState = init "/"
+  pure app
